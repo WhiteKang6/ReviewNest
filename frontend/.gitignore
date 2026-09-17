@@ -1,0 +1,7 @@
+# nginx 运行时产物
+logs/
+temp/
+
+# nginx 发行包自带文档/脚本，与项目无关
+docs/
+contrib/

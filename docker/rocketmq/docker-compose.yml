@@ -1,0 +1,45 @@
+# 本地 RocketMQ 单机部署（学习用）
+# 镜像需已下载：apache/rocketmq:5.3.1、apacherocketmq/rocketmq-dashboard:latest
+# 启动：  docker compose -f docker/rocketmq/docker-compose.yml up -d
+# 停止：  docker compose -f docker/rocketmq/docker-compose.yml down
+# Dashboard: http://localhost:8080  (Namesrv 地址已配 namesrv:9876)
+services:
+  namesrv:
+    image: apache/rocketmq:5.3.1
+    container_name: rmqnamesrv
+    ports:
+      - "9876:9876"
+    command: sh mqnamesrv
+    networks:
+      - rocketmq
+
+  broker:
+    image: apache/rocketmq:5.3.1
+    container_name: rmqbroker
+    depends_on:
+      - namesrv
+    ports:
+      - "10909:10909"
+      - "10911:10911"
+      - "10912:10912"
+    volumes:
+      - ./broker.conf:/home/rocketmq/rocketmq-5.3.1/conf/broker.conf
+    command: sh mqbroker -n namesrv:9876 -c /home/rocketmq/rocketmq-5.3.1/conf/broker.conf
+    networks:
+      - rocketmq
+
+  dashboard:
+    image: apacherocketmq/rocketmq-dashboard:latest
+    container_name: rmqdashboard
+    depends_on:
+      - namesrv
+    ports:
+      - "8086:8082"
+    environment:
+      - JAVA_OPTS=-Drocketmq.namesrv.addr=namesrv:9876
+    networks:
+      - rocketmq
+
+networks:
+  rocketmq:
+    driver: bridge
