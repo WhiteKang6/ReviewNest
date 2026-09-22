@@ -8,18 +8,25 @@ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.hmdp.dto.Result;
 import com.hmdp.entity.Shop;
 import com.hmdp.mapper.ShopMapper;
+import com.hmdp.mq.ShopCacheInvalidMsg;
 import com.hmdp.service.IShopService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.utils.CacheClient;
+import com.hmdp.utils.MqConstants;
 import com.hmdp.utils.RedisConstants;
 import com.hmdp.utils.RedisData;
 import com.hmdp.utils.SystemConstants;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.rocketmq.client.producer.SendResult;
+import org.apache.rocketmq.client.producer.SendStatus;
+import org.apache.rocketmq.spring.core.RocketMQTemplate;
 import org.springframework.data.geo.Distance;
 import org.springframework.data.geo.GeoResult;
 import org.springframework.data.geo.GeoResults;
 import org.springframework.data.redis.connection.RedisGeoCommands;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.domain.geo.GeoReference;
+import org.springframework.messaging.support.MessageBuilder;
 import org.springframework.stereotype.Service;
 
 import jakarta.annotation.Resource;
@@ -43,12 +50,15 @@ import static com.hmdp.utils.RedisConstants.SHOP_GEO_KEY;
  * @since 2021-12-22
  */
 @Service
+@Slf4j
 public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IShopService {
 
     @Resource
     private StringRedisTemplate  stringRedisTemplate;
     @Resource
     private CacheClient cacheClient;
+    @Resource
+    private RocketMQTemplate rocketMQTemplate;
     @Override
     public Result queryShopById(Long id) {
         //缓存穿透
@@ -214,10 +224,41 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         if(id == null){
             return Result.fail("商铺id不能为空");
         }
-        //先修改数据库，在删除缓存
+        String key = RedisConstants.CACHE_SHOP_KEY+id;
+        //1.先修改数据库，数据库是唯一可信数据源
         updateById(shop);
-        stringRedisTemplate.delete(RedisConstants.CACHE_SHOP_KEY+id);
+        //2.再删除缓存；删失败不把异常抛给用户，转 MQ 异步补偿
+        try {
+            Boolean deleted = stringRedisTemplate.delete(key);
+            if(!BooleanUtil.isTrue(deleted)){
+                //删除数为 0：缓存本就不存在，无需补偿
+                return Result.ok();
+            }
+        } catch (Exception e) {
+            //Redis 宕机/超时：库已是新值、缓存还是旧值，必须补偿
+            log.error("删除商铺缓存失败，转 MQ 补偿 shopId={}", id, e);
+            sendCacheInvalidMsg(id, e);
+        }
         return Result.ok();
+    }
+
+    /**
+     * 发送缓存失效补偿消息。补偿是尽力而为：消息也发不出去时，
+     * 只能靠 CACHE_SHOP_TTL 过期自愈，此处记日志便于人工介入。
+     */
+    private void sendCacheInvalidMsg(Long id, Throwable cause){
+        ShopCacheInvalidMsg msg = new ShopCacheInvalidMsg()
+                .setShopId(id)
+                .setReason(cause.getClass().getSimpleName() + ": " + cause.getMessage());
+        try {
+            SendResult sendResult = rocketMQTemplate.syncSend(MqConstants.TOPIC_CACHE_INVALIDATE,
+                    MessageBuilder.withPayload(msg).build());
+            if(sendResult == null || sendResult.getSendStatus() != SendStatus.SEND_OK){
+                log.error("缓存补偿消息发送失败，将依赖 TTL 兜底 shopId={}", id);
+            }
+        } catch (Exception e) {
+            log.error("缓存补偿消息发送异常，将依赖 TTL 兜底 shopId={}", id, e);
+        }
     }
 
     @Override
