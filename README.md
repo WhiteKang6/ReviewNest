@@ -3,7 +3,7 @@
 > 基于 Redis 的本地生活点评系统全栈项目。以 **「缓存问题 → 秒杀问题 → 消息补偿」** 为主线逐提交演进，每个方案都保留了前一代实现作对照。
 >
 > 后端：Spring Boot 3.2 / Java 17 / MyBatis-Plus / Redis / Redisson / RocketMQ
-> 前端：nginx 静态页面（非 React / Vue 工程）
+> 前端：Vue 3 + Vite 工程（Vue Router / Element Plus / axios），nginx 托管构建产物
 
 ---
 
@@ -57,7 +57,8 @@
 | 工具 | Hutool | 5.8.27 | JSON、Bean 拷贝、随机数 |
 | 简化 | Lombok | Boot 管理 | `@Data`、`@Slf4j` |
 | AOP | aspectjweaver | Boot 管理 | 事务代理 |
-| 前端 | nginx | 发行版整体入库 | 静态页面托管 |
+| 前端 | Vue 3 + Vite | 3.5 / 8.x | SFC、Vue Router(history)、Element Plus 全量引入(未做按需优化) |
+| 前端 HTTP 服务 | nginx | 本机发行版(不入库) | 托管 `dist/`、反向代理 `/api`、`/imgs/` 直出 public/imgs |
 
 ---
 
@@ -88,10 +89,20 @@ ReviewNest/
 │           ├── seckill.lua            # 秒杀核心脚本
 │           ├── seckill_rollback.lua   # MQ 发送失败回补脚本
 │           └── unlock.lua             # 安全解锁脚本
-└── frontend/                         # ⚠ nginx 发行版整体，含 nginx.exe，共 17M
-    ├── nginx.exe
-    ├── conf/nginx.conf
-    └── html/hmdp/                    # 静态页面（index/login/shop-detail/blog-edit …）
+└── frontend/                         # Vue 3 + Vite 工程(nginx.exe 本机保留，不入库)
+    ├── index.html                    # Vite 入口
+    ├── package.json / vite.config.js # dev 代理 /api → 8081(带 rewrite，见 §4.2)
+    ├── conf/nginx.conf               # root=dist、/api 代理、/imgs → public/imgs
+    ├── public/
+    │   ├── favicon.ico
+    │   └── imgs/                     # 示例图片 + 上传图片(后端 IMAGE_UPLOAD_DIR 指向此处)
+    ├── src/
+    │   ├── api/                      # axios 封装(request.js)+ 按域接口函数
+    │   ├── components/FootBar.vue    # 底部导航
+    │   ├── utils/                    # format.js(金额格式化)、auth.js(token)
+    │   ├── views/                    # 10 个页面 SFC(Home/Login/ShopList/ShopDetail/BlogEdit/BlogDetail/Info/…)
+    │   └── assets/css/               # 原静态页 8 个自定义 css
+    └── dist/                         # 构建产物(npm run build，不入库)
 ```
 
 ---
@@ -148,13 +159,23 @@ mvn spring-boot:run          # 端口 8081
 
 **⑤ 前端**
 
+开发模式(热更新):
+
 ```bash
-# 先按 §5.1 处理图片上传目录，再启动 nginx
 cd frontend
-./nginx.exe
+npm install      # 首次
+npm run dev      # http://localhost:5173，/api 代理到 8081(带 rewrite)，图片由 vite 直出 public/imgs
 ```
 
-浏览器访问 http://localhost/ ，进入 `hmdp/` 目录下的静态页面。
+生产模式(构建 + nginx):
+
+```bash
+cd frontend
+npm run build    # 产物 dist/；public/imgs 会整体拷贝进去(上传图片跨构建存活，因为 emptyOutDir 只清 dist)
+./nginx.exe      # http://localhost:8080
+```
+
+浏览器访问 http://localhost:8080/ 。history 路由的深链接(如 `/shop-detail?id=1`)由 nginx `try_files` 回退到 index.html；`/imgs/` 由 nginx alias 直出 `public/imgs`，新上传的图片无需重新构建即可访问。
 
 ### 4.3 关键配置速查（`backend/src/main/resources/application.yaml`）
 
@@ -180,18 +201,15 @@ rocketmq.producer.retry-times-when-send-failed: 0     # 不内部重试，语义
 
 > 这一节是本 README 里最实用的部分。以下每一项都是**当前仓库真实存在的问题**，不是假设。
 
-### 5.1 ⚠ 图片上传目录指向仓库外的另一个 nginx
+### 5.1 ✅ 已修复：图片上传目录迁回仓库内
 
-`SystemConstants.IMAGE_UPLOAD_DIR` 硬编码为：
+前端重构时 `SystemConstants.IMAGE_UPLOAD_DIR` 已改为 `frontend\public\imgs`(见 §三 目录结构)：
 
-```java
-public static final String IMAGE_UPLOAD_DIR = "C:\\code\\java\\redis-study\\nginx-1.18.0\\html\\hmdp\\imgs\\";
-```
+- **dev**：vite 直接服务 `public/`，上传图片立即可见；
+- **build**：`public/*` 整体拷贝进 `dist/`，`emptyOutDir` 只清 dist 不动 public → **上传图片跨构建存活**；
+- **nginx**：`location /imgs/` alias 到 `public/imgs/`，两次构建之间新上传的图片也可见。
 
-注意这是 `nginx-1.18.0\html\hmdp\imgs\`，**不是**本仓库的 `frontend\html\hmdp\imgs\`。
-
-- 换机器 / 路径不同 → `POST /upload/blog` 直接抛 `IOException` → 返回 `Result.fail("文件上传失败")`
-- 改的时候要么改常量，要么把这个目录软链 / 复制成本地 nginx 的 `imgs`
+⚠ 上传图片会落在 `public/imgs` 里，属于本地运行时产物，**不要提交**（示例图片是一次性入库的）。
 
 ### 5.2 ⚠ RocketMQ `broker.conf` 硬编码局域网 IP
 
@@ -208,6 +226,8 @@ Broker 注册给 NameServer 的地址是**宿主机局域网 IP**，不是容器
 
 配置文件末尾给了一个一劳永逸的方案：改用服务名 `broker` + 在 Windows hosts 里加 `127.0.0.1 broker`（需管理员权限改一次）。
 
+**延迟消息档位**：同文件还自定义了 `messageDelayLevel`（第 15 档 = 15m，供订单超时取消，见 §8.13）。改这个文件后必须**重启 broker 容器**才生效；代码侧 `SystemConstants.DELAY_LEVEL_ORDER_TIMEOUT` 必须与档位表一致，两边是同一份事实的两处拷贝。
+
 ### 5.3 ⚠ 数据库密码硬编码
 
 `application.yaml` 里是 `root / root123`，本机 MySQL 就是这个配置。换机器需同步。
@@ -216,9 +236,9 @@ Broker 注册给 NameServer 的地址是**宿主机局域网 IP**，不是容器
 
 `RedissonConfig` 里写死 `redis://127.0.0.1:6379`，**没有**从 `spring.data.redis` 读取。两处地址若不一致会静默指向不同实例（本仓库恰好都是 6379，所以没暴露问题）。
 
-### 5.5 ⚠ frontend 目录把 nginx 发行版整体提交了
+### 5.5 ✅ 已修复：nginx 发行版已移出 git
 
-`frontend/` 共 17M，含 3.6M 的 `nginx.exe`、`contrib/`、`docs/` 等无用内容。`.gitignore` 目前只排除了 `.idea/` 和 `.zcode/`。
+前端重构时把 `nginx.exe`、conf 附带文件(mime.types 等)、html 默认页用 `git rm --cached` 移出(本机文件保留可继续运行)，`.gitignore` 追加 `nginx.exe`、`html/`、`node_modules/`、`dist/`。仓库瘦身约 17M；`docs/`、`contrib/` 原本就未入库。
 
 ### 5.6 ⚠ JDK 版本声明与实际不一致
 
@@ -406,6 +426,9 @@ public class WebExceptionAdvice {
 | POST | `/voucher/seckill` | 新增秒杀券（同步写 Redis 库存） | `ok(voucherId)` |
 | GET | `/voucher/list/{shopId}` | 店铺券列表 | `ok(List<Voucher>)` |
 | POST | `/voucher-order/seckill/{id}` | **秒杀下单** | `ok(orderId)` |
+| POST | `/voucher-order/pay/{id}?payType=1` | **模拟支付**，1 余额 / 2 支付宝 / 3 微信 | `ok("支付成功")` |
+| POST | `/voucher-order/callback/{id}?payType=1` | 支付结果回调（幂等落状态） | `ok("支付成功")` / `ok("订单已支付")` |
+| GET | `/voucher-order/detail/{id}` | 查自己的订单，核对支付状态 | `ok(VoucherOrder)` |
 
 ---
 
@@ -931,6 +954,70 @@ GeoResults<RedisGeoCommands.GeoLocation<String>> results =
 
 ---
 
+### 8.12 支付：一条 CAS UPDATE 落实订单状态
+
+订单落库时不带 `status`，由 `hmdp.sql` 的列默认值给成 `1 未支付`。支付要做的只有一件事：**把 `1` 原子地改成 `2 已支付`**。
+
+| 接口 | 作用 |
+|---|---|
+| `POST /voucher-order/pay/{id}?payType=1` | 用户发起支付：校验订单归属、支付方式、当前状态，再走回调落实 |
+| `POST /voucher-order/callback/{id}?payType=1` | 支付结果回调（模拟支付通道）：幂等落实状态 |
+| `GET /voucher-order/detail/{id}` | 查自己订单，核对状态是否已落实 |
+
+核心就是那条带条件的 UPDATE：
+
+```sql
+UPDATE tb_voucher_order
+   SET status = 2, pay_type = ?, pay_time = NOW()
+ WHERE id = ? AND status = 1;
+```
+
+`AND status = 1` 一条条件同时挡住三件事：
+
+1. **重复回调**——第二次 UPDATE 命中 0 行，`pay_time` 只写一次；
+2. **并发双击**——两个并发请求只有一个改得到，另一个拿到 0 行；
+3. **越状态覆盖**——已取消、已核销、退款中的订单不会被强行改成已支付。
+
+命中 0 行时**重读一次订单状态**再给文案：已经是 `已支付` 就返回成功（幂等语义，回调方不用关心是不是自己成功的），其它状态返回失败原因。所以不需要给回调加事务或分布式锁——单条 UPDATE 本身就是原子的。
+
+`pay` 和 `callback` 拆开是照真实支付链路的形状来的：正常流程里支付结果由第三方通道**异步回调**，`pay` 只负责拉起收银台。这里 mock 掉中间环节，直接同步调回调；`callback` 单独留出来方便连打两次验证幂等。
+
+状态和支付方式的常量统一放在 `SystemConstants`（`ORDER_STATUS_*` / `PAY_TYPE_*`），文案在 `orderStatusMsg`，业务代码里不要裸写 `1`、`2`。
+
+**验证幂等**：同一个 id 连调两次 `/callback/{id}`，第二次返回 `ok("订单已支付")`，库里 `pay_time` 不变。
+
+⚠ 支付只做状态落实，**不涉及库存**——订单创建时就扣过库存了，取消时才会回补，见 [§8.13](#813-未支付订单自动取消延迟消息为主兜底扫描为辅)。
+
+---
+
+### 8.13 未支付订单自动取消：延迟消息为主，兜底扫描为辅
+
+下单落库后（`createVoucherOrder`）发一条 **RocketMQ 延迟消息**（`order_timeout` 主题，第 15 档 = 15 分钟，档位表在 `broker.conf` 的 `messageDelayLevel`，改完需重启 broker）。到期 `VoucherOrderTimeoutConsumer` 消费，把 `status=1` 的订单取消。
+
+**取消的核心是一条 CAS**：
+
+```sql
+UPDATE tb_voucher_order SET status = 4 WHERE id = ? AND status = 1;
+```
+
+与支付（`status 1→2`）并发时行级互斥，谁先改到谁赢，**无需分布式锁**；重复取消（延迟消息重投 / 与兜底扫描并发）只生效一次，库存只回补一次。
+
+**取消一个事务内做三件事**：
+
+1. CAS `1 → 4`，命中 0 行直接跳过（已支付/已取消/已核销）；
+2. DB 库存回补：`tb_seckill_voucher.stock + 1`；
+3. Redis 预扣回补：复用 `seckill_rollback.lua`（`INCR seckill:stock:{id}` + `SREM seckill:order:{id}`）。**刻意不吞异常**：失败上抛 → 事务回滚 → 消息重投/兜底重扫自愈——与 MQ 发送失败场景的 `rollbackRedis`（吞异常、靠日志对账）语义相反，两个方法都写了注释区分。
+
+**兜底扫描**（`@Scheduled`，60s 一次，`sweepExpiredOrders`）：`WHERE status=1 AND create_time < now-15min LIMIT 500`，走新增的 `idx_status_create_time` 索引，逐个走同一个取消方法。延迟消息丢失/发送失败（发送只记日志、不阻塞下单）由它补刀，**最坏 15m + 60s 内取消**。
+
+**连带修复：一人一单判重**。原来 `count()` 不过滤状态，取消后订单行还在 → 用户永远不能再买同一张券、Redis 预扣被白白占掉。现在只统计有效订单 `status IN (1,2,3)`，**取消后可重买**。
+
+⚠ 因此**放弃**了 [§10.1](#101-唯一索引刻意不建与取消后可重买互斥) 建议的 `(user_id, voucher_id)` 唯一索引——重买意味着同 (user, voucher) 出现第二行订单，唯一索引会拒绝插入。二者互斥，取重买、弃唯一索引。
+
+> **验证提示**：RocketMQ 延迟消息按"发送后第 15 档"投递，与订单 `create_time` 无关。手动把 `create_time` 改早模拟超时后，兜底扫描会在 60s 内取消；此时 15 分钟后的延迟消息再到达，消费端 CAS 命中 0 行直接跳过——两条链路互不干扰。
+
+---
+
 ## 九、方案对比与取舍
 
 面试时最容易问的几组，直接给结论。
@@ -985,28 +1072,22 @@ GeoResults<RedisGeoCommands.GeoLocation<String>> results =
 
 > 以下为**当前仓库真实存在的问题**，不是理论推演。每一条都经过代码核对。
 
-### 10.1 ⚠ 唯一索引未建，消费者幂等分支是死代码
+### 10.1 ⚠ 唯一索引刻意不建：与「取消后可重买」互斥
 
-`VoucherOrderConsumer` 注释写着"唯一索引命中（`DataIntegrityViolationException`）视为幂等成功"，`createVoucherOrder` 注释也写着"命中唯一索引会抛 `DataIntegrityViolationException`"。
+`tb_voucher_order` 没有 `(user_id, voucher_id)` 唯一索引（全库唯一索引只有 `tb_user` 的 `uniqe_key_phone(phone)`——字段名 `uniqe` 是拼写错误）。这原本是技术债：MQ 重投同一订单只能靠 `count() > 0` 软判重 + Redisson 锁兜底，存在理论并发窗口。
 
-但 `hmdp.sql` 全库**只有一个唯一索引**：`tb_user` 的 `uniqe_key_phone(phone)`（顺带提一句，字段名 `uniqe` 是拼写错误）。`tb_voucher_order` 只有主键 `id`，**没有** `(user_id, voucher_id)` 唯一索引。
+但 [§8.13](#813-未支付订单自动取消延迟消息为主兜底扫描为辅) 落地「取消后可重买」后，**唯一索引方案正式作废**：重买 = 同 (user, voucher) 出现第二行订单，唯一索引会拒绝插入。二者互斥，本仓库取重买、弃唯一索引：
 
-**影响**：MQ 重投同一订单时，数据库不会拒绝，只会靠 `count() > 0` 的查询判重挡住。查询判重是软判重，理论上存在并发窗口（虽有 Redisson 锁兜着）。
+- `createVoucherOrder` 判重已改为只统计有效订单 `status IN (1,2,3)`（已取消/已退款不算）；
+- MQ 重投的幂等仍由软判重 + Redisson 锁兜底——理论并发窗口存在，但 Lua 预扣 + 顺序消费已把它压到极小。
 
-**修复**：
-
-```sql
-ALTER TABLE tb_voucher_order
-  ADD UNIQUE KEY uniq_user_voucher (user_id, voucher_id);
-```
-
-`tb_follow` 同样缺 `(user_id, follow_user_id)` 唯一索引，重复关注可以插入多条。
+`tb_follow` 仍缺 `(user_id, follow_user_id)` 唯一索引，重复关注可以插入多条——这条与重买无关，想补可以单独补。
 
 ### 10.2 ⚠ 密码登录未实现，`PasswordEncoder` 是孤儿类
 
 `utils/PasswordEncoder.java`（盐 + MD5，`salt@md5` 格式）定义完整，但**全仓库无任何引用**。
 
-准确说，密码登录是「**字段齐全、逻辑缺失**」：`LoginFormDTO` 有 `password` 字段、`tb_user` 有 `password` 列（种子数据里全是空串）、`PasswordEncoder` 也写好了，唯独 `UserServiceImpl.login` 里只有短信验证码分支——**既不写密码，也不校验密码**。前端 `login.html` / `login2.html` 也都是验证码登录。
+准确说，密码登录是「**字段齐全、逻辑缺失**」：`LoginFormDTO` 有 `password` 字段、`tb_user` 有 `password` 列（种子数据里全是空串）、`PasswordEncoder` 也写好了，唯独 `UserServiceImpl.login` 里只有短信验证码分支——**既不写密码，也不校验密码**。前端重构后 `Login.vue` 是验证码登录；`Login2.vue`（密码登录页）**仅作演示保留**，提交 password 必然失败，页面代码里有注释注明（README §10.2）。
 
 顺带一提：即便实现了，**MD5 + 随机盐**在当今也不推荐，应该用 BCrypt。
 
@@ -1092,11 +1173,17 @@ private static final String ID_PREFIX = UUID.randomUUID().toString(true) + "-";
 | `LoginInterceptor` 依赖 ThreadLocal，`RefreshTokenInterceptor` 的 401 被注释 | 匿名请求访问必须登录的接口 → NPE → "服务器异常" |
 | `CacheClient.CACHE_REBUILD_EXECUTOR` = 无界队列 `newFixedThreadPool(10)` | 极端情况下任务堆积 OOM |
 | `RedissonConfig` 硬编码 `redis://127.0.0.1:6379`，未复用 `spring.data.redis` | 两处配置可能漂移 |
+
+### 10.11 ⚠ 核销与退款无入口，回调接口语义仍是 mock
+
+`status` 列定义了 6 个状态，代码落了 `1 → 2`（支付，§8.12）和 `1 → 4`（超时自动取消，§8.13），**`3 已核销 / 5 退款中 / 6 已退款` 仍无入口**，`use_time` / `refund_time` 永远为 null。核销需要"商家端验证券码"的入口；退款需要已支付订单的取消 + 回补——回补逻辑可直接复用 `cancelVoucherOrder` 里的 CAS + 双库存回补，只是状态目标换成 `5/6`。
+
+**回调接口仍走登录校验**：`/voucher-order/callback/{id}` 没加进 `MvcConfig` 的 `excludePathPatterns`，所以必须登录才能调。真实回调来自支付通道、不认用户 token，应改成签名校验（时间戳 + sign 参数）。mock 阶段用"订单必须属于当前用户"兜着，越权风险为零，但语义上是错的。
 | `tb_sign` 表存在但代码用 Redis Bitmap | 建表语句是模板遗留 |
 | `followOrNot` 查库不查 Redis | 与关注关系存在 Redis Set 的设计不一致 |
 | `getCommonFollow` 有 `// todo缓存没命中怎么办` | 缓存缺失时不回源，直接返回空 |
 | `queryWithMutex` 用字面量 `"lock:shop:"` | `LOCK_SHOP_KEY` 常量定义了但没用 |
-| `frontend/` 提交了 17M nginx 发行版（含 `nginx.exe`） | 仓库体积虚高，`.gitignore` 未排除 |
+| ~~frontend/ 提交 17M nginx 发行版~~ | ✅ 已修复，见 §5.5 |
 | `pom.xml` 声明 Java 17，本机 JDK 21 | 可编译但环境不一致 |
 
 ---
@@ -1108,7 +1195,7 @@ private static final String ID_PREFIX = UUID.randomUUID().toString(true) + "-";
 | 脚本 | 作用 | 参数 | 返回值 |
 |---|---|---|---|
 | `seckill.lua` | 判断库存 + 一人一单 + 预扣 | `voucherId, userId, orderId` | `0` 成功 / `1` 库存不足 / `2` 重复下单 |
-| `seckill_rollback.lua` | MQ 发送失败回补 | `voucherId, userId` | `0` |
+| `seckill_rollback.lua` | MQ 发送失败回补 / 订单超时取消回补 | `voucherId, userId` | `0` |
 | `unlock.lua` | 比对 value 后安全解锁 | `KEYS[1]` 锁 key, `ARGV[1]` 持有者标识 | `del` 结果 / `0` |
 
 ### B. RocketMQ Topic 一览
@@ -1117,6 +1204,7 @@ private static final String ID_PREFIX = UUID.randomUUID().toString(true) + "-";
 |---|---|---|---|---|---|
 | `seckill_order` | `seckill_producer_group`（`syncSendOrderly`，sharding key = userId） | `seckill_consumer_group` | `ORDERLY` | 5 | 秒杀异步下单 |
 | `cache_invalidate` | 同上（`syncSend`） | `cache_invalidate_group` | `CONCURRENTLY`（默认） | 5 | 商铺缓存删除补偿 |
+| `order_timeout` | 秒杀消费者（`syncSend`，延迟第 15 档 = 15m） | `order_timeout_group` | `CONCURRENTLY`（默认） | 默认 | 订单超时取消（§8.13） |
 
 两者都是**死信队列兜底**：重试耗尽后进 DLQ，不再阻塞业务。
 

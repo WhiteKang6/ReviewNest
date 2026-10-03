@@ -5,3 +5,15 @@ temp/
 # nginx 发行包自带文档/脚本，与项目无关
 docs/
 contrib/
+
+# nginx 可执行文件与默认欢迎页(本地保留，不入库)
+nginx.exe
+html/
+
+# conf 附带文件(nginx 运行需要，不入库)，nginx.conf 例外
+conf/*
+!conf/nginx.conf
+
+# 前端工程产物
+node_modules/
+dist/
