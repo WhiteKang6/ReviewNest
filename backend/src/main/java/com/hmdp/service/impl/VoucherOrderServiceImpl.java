@@ -10,7 +10,9 @@ import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherOrderService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.utils.LockImpl;
+import com.hmdp.utils.MqConstants;
 import com.hmdp.utils.RedisIdWorker;
+import com.hmdp.utils.SystemConstants;
 import com.hmdp.utils.UserHolder;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.rocketmq.client.producer.SendResult;
@@ -26,6 +28,7 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.lang.NonNull;
 import org.springframework.messaging.support.MessageBuilder;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -37,6 +40,7 @@ import java.time.LocalDateTime;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
@@ -444,9 +448,11 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     @Override
     public void createVoucherOrder(VoucherOrder voucherOrder) {
         //4.一人一单
-        //4.1查询订单存在吗
+        //4.1查询有效订单（未支付/已支付/已核销）存在吗——已取消/已退款不算，允许取消后重新购买
         Long userId = voucherOrder.getUserId();
-        Long count = query().eq("user_id", userId).eq("voucher_id", voucherOrder.getVoucherId()).count();
+        Long count = query().eq("user_id", userId).eq("voucher_id", voucherOrder.getVoucherId())
+                .in("status", SystemConstants.ORDER_STATUS_UNPAID, SystemConstants.ORDER_STATUS_PAID, SystemConstants.ORDER_STATUS_USED)
+                .count();
         if (count > 0) {
             log.error("您已购买过该优惠券");
             return;
@@ -462,7 +468,176 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             log.error("库存不足");
             return;
         }
-        //6. 创建订单（命中唯一索引会抛 DataIntegrityViolationException，由消费者幂等处理）
+        //6. 创建订单（软判重 + Redisson 锁兜底；无唯一索引——与"取消后可重买"互斥，见 README §10.1）
         save(voucherOrder);
+        //7. 预约 15 分钟超时检查（延迟消息发送失败不阻塞下单，由兜底扫描补偿）
+        sendTimeoutCheck(voucherOrder.getId());
+    }
+
+    /**
+     * 发送订单超时检查延迟消息。
+     * 失败只记日志：兜底扫描（sweepExpiredOrders）会补偿。
+     * 发送发生在事务提交前，若提交失败会留下孤儿延迟消息，取消侧对"订单不存在"直接忽略。
+     */
+    private void sendTimeoutCheck(Long orderId) {
+        try {
+            rocketMQTemplate.syncSend(MqConstants.TOPIC_ORDER_TIMEOUT,
+                    MessageBuilder.withPayload(orderId).build(),
+                    3000, SystemConstants.DELAY_LEVEL_ORDER_TIMEOUT);
+        } catch (Exception e) {
+            log.error("延迟取消消息发送失败，将由兜底扫描补偿 orderId={}", orderId, e);
+        }
+    }
+
+    @Override
+    @Transactional
+    public boolean cancelVoucherOrder(Long orderId) {
+        //1.订单必须存在（孤儿延迟消息/订单不存在时直接忽略）
+        VoucherOrder order = getById(orderId);
+        if (order == null) {
+            log.warn("取消订单跳过：订单不存在 orderId={}", orderId);
+            return false;
+        }
+        //2.CAS：只有未支付订单能被取消。已支付/已取消/已核销命中 0 行，幂等跳过
+        //  （取消与支付并发时行级 CAS 互斥，谁先改到谁赢，无需分布式锁）
+        boolean cas = update().eq("id", orderId)
+                .eq("status", SystemConstants.ORDER_STATUS_UNPAID)
+                .set("status", SystemConstants.ORDER_STATUS_CANCELLED)
+                .update();
+        if (!cas) {
+            log.info("取消订单跳过：订单非未支付状态 orderId={}", orderId);
+            return false;
+        }
+        //3.回补 DB 库存（仅 CAS 成功时执行一次，不会重复回补）
+        seckillVoucherService.update().setSql("stock = stock + 1")
+                .eq("voucher_id", order.getVoucherId())
+                .update();
+        //4.回补 Redis 预扣（INCR 库存 + 移除用户下单标记）。
+        //   与 rollbackRedis 不同：这里不吞异常——失败上抛 → 事务回滚 → 延迟消息重投/兜底重扫自愈
+        stringRedisTemplate.execute(SECKILL_ROLLBACK_SCRIPT,
+                Collections.emptyList(),
+                order.getVoucherId().toString(), order.getUserId().toString());
+        log.info("未支付订单已自动取消 orderId={}, userId={}, voucherId={}",
+                orderId, order.getUserId(), order.getVoucherId());
+        return true;
+    }
+
+    @Override
+    @Scheduled(fixedDelay = SystemConstants.ORDER_CANCEL_SWEEP_MS)
+    public int sweepExpiredOrders() {
+        try {
+            // 走 (status, create_time) 联合索引，只取 id 减少传输
+            List<VoucherOrder> expired = query()
+                    .select("id")
+                    .eq("status", SystemConstants.ORDER_STATUS_UNPAID)
+                    .lt("create_time", LocalDateTime.now().minusMinutes(SystemConstants.ORDER_PAY_TIMEOUT_MINUTES))
+                    .last("LIMIT 500")
+                    .list();
+            if (expired.isEmpty()) {
+                return 0;
+            }
+            int handled = 0;
+            for (VoucherOrder order : expired) {
+                // 走 self 代理：cancelVoucherOrder 的 @Transactional 才会生效
+                if (self.cancelVoucherOrder(order.getId())) {
+                    handled++;
+                }
+            }
+            if (handled > 0) {
+                log.info("兜底扫描取消未支付订单 {} 个", handled);
+            }
+            return handled;
+        } catch (Exception e) {
+            log.error("兜底扫描异常，下轮重试", e);
+            return 0;
+        }
+    }
+
+    /* ========================= 模拟支付：落实订单支付状态 ========================= */
+
+    @Override
+    public VoucherOrder getVoucherOrderDetail(Long orderId) {
+        // 只能查自己的订单，防止越权读取他人订单
+        Long userId = UserHolder.getUser().getId();
+        return query().eq("id", orderId).eq("user_id", userId).one();
+    }
+
+    @Override
+    public Result payVoucherOrder(Long orderId, Integer payType) {
+        //1.校验支付方式
+        if (!isValidPayType(payType)) {
+            return Result.fail("支付方式不合法");
+        }
+        //2.校验订单存在且归属当前用户
+        VoucherOrder order = getVoucherOrderDetail(orderId);
+        if (order == null) {
+            return Result.fail("订单不存在");
+        }
+        //3.只有未支付的订单可以支付；其它状态说明没扣款，直接返回当前状态
+        if (!Objects.equals(order.getStatus(), SystemConstants.ORDER_STATUS_UNPAID)) {
+            return Result.fail(orderStatusMsg(order.getStatus()));
+        }
+        //4.模拟支付通道扣款成功。真实场景这里拉起收银台/调第三方，
+        //   支付结果由通道异步回调 payCallback 落实；mock 直接同步调回调
+        return payCallback(orderId, payType);
+    }
+
+    @Override
+    public Result payCallback(Long orderId, Integer payType) {
+        //1.校验：支付方式 + 订单存在
+        if (!isValidPayType(payType)) {
+            return Result.fail("支付方式不合法");
+        }
+        VoucherOrder order = getVoucherOrderDetail(orderId);
+        if (order == null) {
+            return Result.fail("订单不存在");
+        }
+        //2.CAS 落状态（单条 UPDATE 自带原子性，无需事务）
+        if (settleVoucherOrder(orderId, payType)) {
+            return Result.ok("支付成功");
+        }
+        //3.CAS 未命中：并发重复回调，或订单已被取消/核销。重读一次给出准确文案
+        VoucherOrder latest = getVoucherOrderDetail(orderId);
+        Integer status = latest == null ? null : latest.getStatus();
+        // 已支付 = 重复回调，视为成功（幂等）
+        return Objects.equals(status, SystemConstants.ORDER_STATUS_PAID)
+                ? Result.ok("订单已支付")
+                : Result.fail(orderStatusMsg(status));
+    }
+
+    /**
+     * CAS 落实支付状态：`WHERE id=? AND status=1` 保证
+     * - 重复回调/并发支付只有第一次生效，不会重复写支付时间；
+     * - 不会把已取消、已核销、退款中的订单强行改成已支付。
+     */
+    private boolean settleVoucherOrder(Long orderId, Integer payType) {
+        return update()
+                .set("status", SystemConstants.ORDER_STATUS_PAID)
+                .set("pay_type", payType)
+                .set("pay_time", LocalDateTime.now())
+                .eq("id", orderId)
+                .eq("status", SystemConstants.ORDER_STATUS_UNPAID)
+                .update();
+    }
+
+    private boolean isValidPayType(Integer payType) {
+        return payType != null
+                && payType >= SystemConstants.PAY_TYPE_BALANCE
+                && payType <= SystemConstants.PAY_TYPE_WECHAT;
+    }
+
+    private String orderStatusMsg(Integer status) {
+        if (status == null) {
+            return "订单不存在";
+        }
+        return switch (status) {
+            case SystemConstants.ORDER_STATUS_UNPAID -> "订单未支付";
+            case SystemConstants.ORDER_STATUS_PAID -> "订单已支付，请勿重复支付";
+            case SystemConstants.ORDER_STATUS_USED -> "订单已核销，无法支付";
+            case SystemConstants.ORDER_STATUS_CANCELLED -> "订单已取消";
+            case SystemConstants.ORDER_STATUS_REFUNDING -> "订单退款中";
+            case SystemConstants.ORDER_STATUS_REFUNDED -> "订单已退款";
+            default -> "订单状态异常";
+        };
     }
 }
