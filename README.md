@@ -39,6 +39,8 @@
 
 **配套文档**：[`backend/Redis数据结构应用总结.md`](backend/Redis数据结构应用总结.md) —— Redis 数据结构逐个场景的用法总结，与本 README 互补。本 README 侧重「为什么这么做」和工程细节，那份侧重「每个数据结构用在哪」。
 
+**AI 开发闭环**（按《AI开发测试闭环落地指南.md》维护，AI 每轮开工必读）：[`CONSTRAINTS.md`](CONSTRAINTS.md) 是项目约束与历史教训（最值钱的一份）；模块规格见 [`docs/specs/`](docs/specs/)，边界用例表见 [`docs/cases/`](docs/cases/)。
+
 ---
 
 ## 二、技术栈

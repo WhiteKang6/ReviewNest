@@ -1,0 +1,28 @@
+# 边界用例表：voucher-order（L2 接口层模板）
+
+> 模板。用 Apifox 数据驱动 / supertest 等跑批。`voucherId` 需替换为 `hmdp.sql` 里的实际种子数据；
+> `{xx}` 是场景占位，运行时填具体 id（秒杀时间窗、库存、用户都要能对上）。
+
+```csv
+case_name,method,path,param,expect_success,expect_errorMsg
+seckill-ok,POST,/voucher-order/seckill/{voucherId},{voucherId},true,null
+seckill-not-exist,POST,/voucher-order/seckill/999999,,false,优惠券不存在
+seckill-not-started,POST,/voucher-order/seckill/{未开始券id},,false,秒杀未开始
+seckill-expired,POST,/voucher-order/seckill/{已过期券id},,false,秒杀已过期
+seckill-stock-empty,POST,/voucher-order/seckill/{库存0券id},,false,库存不足
+seckill-repeat,POST,/voucher-order/seckill/{voucherId},,false,重复下单
+pay-invalid-paytype,POST,/voucher-order/pay/{orderId}?payType=0,,false,支付方式不合法
+pay-order-not-exist,POST,/voucher-order/pay/999999?payType=1,,false,订单不存在
+pay-ok,POST,/voucher-order/pay/{orderId}?payType=1,,true,支付成功
+pay-already-paid,POST,/voucher-order/pay/{orderId}?payType=1,,false,订单已支付，请勿重复支付
+callback-repeat,POST,/voucher-order/callback/{orderId}?payType=1,,true,订单已支付
+callback-after-cancel,POST,/voucher-order/callback/{已取消orderId}?payType=1,,false,订单已取消
+detail-ok,GET,/voucher-order/detail/{orderId},,true,null
+detail-others-order,GET,/voucher-order/detail/{他人orderId},,false,订单不存在
+detail-not-exist,GET,/voucher-order/detail/999999,,false,订单不存在
+```
+
+**并发场景（L3 一致性层，人设计场景）**：同一用户对同一券并发 N 次下单 → 断言
+- 最终订单数 = 1，且 `seckill:order:{voucherId}` 标记只含该用户一次
+- Redis 预扣值 + `tb_seckill_voucher.stock` = 初始库存（守恒，未超卖）
+- 取消后可重买：取消后再下单 → 成功且出现第二行订单
